@@ -7,13 +7,15 @@
 
 Agentic coding fails in a specific, predictable way. The agent builds to *completion*, not to *understanding*. It sees your intent and immediately constructs the "correct" version — abstract base classes, Pydantic models, factory patterns, five layers of indirection — before you've even understood the problem. The code runs. But you didn't walk the path. You inherited a mansion without knowing where the pipes are.
 
-Three specific failure modes compound this:
+Four specific failure modes compound this:
 
 **The Completeness Trap.** The agent skips from intent to finished architecture. You get a smooth, seam-free surface with no visible decision points. You cannot debug what you did not build. You cannot extend what you do not understand.
 
 **The Opacity Problem.** Human programmers leave cognitive breadcrumbs: guard clauses, TODO comments, simple first drafts. The agent fills every gap immediately, leaving no visible trace of the decisions it made. You cannot judge whether an abstraction was necessary because you never saw the simpler version it replaced.
 
 **The Question Vacuum.** The agent never asks the questions that would force you to make decisions. It makes them for you, silently, at speed. You review the output after the fact, not the decisions as they happen.
+
+**The Invisible Assumption.** The agent quietly encodes guesses about the shape of the world into the code itself — a length limit, a matching pattern, a confidence threshold, a format it assumes input will always follow. None of these come from the requirement. All of them look like ordinary code. None of them are visible as decisions unless you go looking. This is the failure mode that survives every other rule in this document — a function can be small, well-named, properly gated, and still be silently wrong the day real data doesn't match the guess.
 
 This document defines the principles, constraints, and question protocol that force agentic coding to work at your speed, in your service.
 
@@ -49,6 +51,9 @@ Before writing any code, the agent must discover and understand what already exi
 
 **9. Surface Intent, Not Just Implementation**
 What the code assumes, what it returns, what it might break, and what it deliberately excludes must be visible without parsing the body. The contract lives at the signature and docstring level, not buried in the logic. A reader should understand what a function does, what preconditions it expects, and what shape it returns — from its surface alone. If reading the first few lines (signature, docstring, return type) doesn't answer these questions, the code is hiding its intent. The skeleton's explanations must survive into the finished implementation: docstrings are not optional, return types must be self-documenting, preconditions must be stated or guarded, and complex expressions must be named. The code teaches itself, or it teaches nothing.
+
+**10. No Unearned Assumptions — Every Magic Value Must Be Justified**
+Any numeric literal, size limit, truncation point, regular expression, format assumption, similarity or confidence threshold, or "this is probably how the input looks" guess is a decision, not a detail. If it isn't derived from the stated requirement, an existing constant already in the codebase, or real example data the human provided, it is a guess wearing the disguise of code. Guesses like this are the single most common source of production failure: they work on the examples the agent imagined and break on the data the agent didn't. The agent must never invent a threshold, limit, pattern, or format assumption silently. It must either derive it from something real, reuse something that already exists, or stop and ask. See Part 2's Magic Value Gate for the enforceable version of this principle.
 
 ---
 
@@ -113,7 +118,7 @@ Conventional filenames are allowed when their contents are tightly scoped to the
 - `types.py`: package-specific type aliases or protocols.
 - `conftest.py`: pytest fixtures and hooks.
 
-These names are not catch-all buckets when the package boundary is clear and the file contains only that conventional concern. For example, `src/payments/exceptions.py` is clearer and more professional than `src/payments/payment_declined_error.py` when it contains only payment exceptions.
+These names are not catch-all buckets when the package boundary is clear and the file contains only that conventional concern. For example, `src/payments/exceptions.py` is clearer and more professional than `src/payments/payment_declined_error.py` when it contains only payment exceptions. Also, for example, a package-scoped `exceptions.py` is clearer and more professional than a longer, redundantly-prefixed filename when it contains only that package's exceptions.
 
 Do not mechanically prefix every file with the package name. The package path is part of the name. Prefer idiomatic, package-scoped names when they are clear; use longer domain-specific names only when convention plus package context still leaves ambiguity.
 
@@ -161,10 +166,10 @@ Multiple technical mechanisms that serve the same business purpose belong in one
 
 | Situation | Verdict |
 |---|---|
-| `connection_pool.py` + `pool_config.py` + `pool_health.py` all serving "database connection management" | One file: `database_connection.py` |
-| `token_counter.py` + `token_budget.py` both only used inside one feature | One file |
-| `user_repository.py` + `payment_processor.py` | Two files — different business domains |
-| `email_sender.py` + `email_template_renderer.py` (template rendering used by many senders) | Two files — genuinely separate concerns with independent callers |
+| Three small files each handling one piece of "connection management" for the same resource | One file |
+| Two small files both only used inside one feature, splitting one calculation into two steps | One file |
+| Two files handling clearly different business domains | Two files — different business domains |
+| A sender module plus a template-rendering module used by several independent senders | Two files — genuinely separate concerns with independent callers |
 
 **The test:** Can a developer understand and modify the entire business feature by opening exactly one file? If not, the file count is wrong — not the developer.
 
@@ -340,6 +345,80 @@ Do you approve the higher cost, or should I simplify?
 
 ---
 
+### The Magic Value Gate (Unjustified Assumptions)
+
+This gate enforces Principle 10. It exists because the failures that matter most in production are rarely structural — they are small, silent, numeric or pattern-based guesses embedded in otherwise clean code. A magic value is any literal or heuristic in the code that encodes a belief about the shape of the world that the agent was never actually told.
+
+**What counts as a magic value:**
+
+| Category | Generic example | The hidden assumption |
+|---|---|---|
+| Size / length limit | `if len(items) > 100:` | "100 is the right cutoff" — based on what? |
+| Truncation | `text[:280]` | Input longer than this is safe to cut, and nothing important lives past that point |
+| Regular expression | `re.match(r'^[A-Za-z]+$', value)` | Every valid value looks like this; nothing valid falls outside the pattern |
+| Confidence / similarity threshold | `if score > 0.8: accept()` | 0.8 is where "good enough" begins |
+| Retry / timeout constant | `timeout = 30`, `retries = 3` | This is how long is "long enough" to wait, or how many attempts is "enough" |
+| Format assumption | `parts = raw.split(",")` then indexing `parts[2]` | The input always has exactly this shape, in this order, with this delimiter |
+| Encoding / locale assumption | treating text as ASCII-only, or dates as always one format | The input will never contain anything outside the assumed set |
+| Sampling / batch size | `batch_size = 50` | This number was chosen for a reason that isn't written down anywhere |
+
+**The test the agent must run before writing any such value:**
+
+1. Does the stated requirement specify this number, pattern, or format explicitly? → Use it, cite the requirement.
+2. Does an existing constant, config value, or schema in the codebase already define this? → Reuse it (see Reuse-Over-Rewrite Rule). Do not invent a second source of truth.
+3. Is it derivable from real example data the human has actually provided? → Derive it, and say how.
+4. None of the above? → **Stop. Do not guess. Ask.**
+
+**The gate phrase.** Whenever the agent is about to write a literal, pattern, or heuristic that fails all three justifications above, it must stop and write:
+
+```
+⏸ MAGIC VALUE GATE: I need a value for [what it controls — e.g. "maximum input length",
+"pattern for matching X", "similarity threshold for a match"].
+I don't have this from the requirement, existing code, or example data.
+Proposed: [value] because [best-available reasoning, clearly labeled as a guess].
+Alternative: leave this unbounded / unvalidated / a plain equality check for now,
+and add a TODO to revisit once real data is available.
+Which do you want — approve the guess, or defer with a TODO?
+```
+
+**Named and justified, always.** Any value that survives this gate — whether supplied by the human, derived from the codebase, or approved as an explicit guess — must be:
+
+- Extracted into a named constant (`MAX_RETRY_COUNT`, not a bare `3` inline).
+- Accompanied by a one-line comment stating where it came from: the requirement, an existing config, real example data, or "approved guess, revisit if wrong."
+
+```python
+# ✗ Silent magic number — no reader can tell if 3 is load-bearing or arbitrary
+for attempt in range(3):
+    ...
+
+# ✓ Named and justified
+MAX_RETRY_COUNT = 3  # from requirement: "retry failed calls up to 3 times"
+for attempt in range(MAX_RETRY_COUNT):
+    ...
+```
+
+```python
+# ✗ Regex invented to match "the examples I imagined"
+if re.match(r'^\w+@\w+\.\w+$', value):
+    ...
+
+# ✓ Either reuse an existing validator...
+if existing_email_validator.is_valid(value):
+    ...
+
+# ✓ ...or flag the guess explicitly instead of hiding it
+# NOTE: this pattern is an approved guess, not derived from a spec or real data.
+# It will reject valid-but-unusual formats. Revisit if real inputs get rejected.
+if re.match(SIMPLE_EMAIL_PATTERN, value):
+    ...
+```
+
+**Truncation and format-parsing require an explicit boundary decision, not a silent slice.** If the agent needs to cut a string, split on a delimiter, or index into a parsed structure, it must state what happens to the part being discarded or assumed, and whether that loss is acceptable — this is a data-shape decision, not an implementation detail, and belongs in the Scope Check / Data Shape Check in Part 5, not buried in a one-liner.
+
+**This gate applies regardless of function size or complexity budget.** A one-line, budget-free, Step-0 function can still fail this gate. Simplicity rules govern structure; this gate governs the values inside that structure.
+
+---
+
 ### The Collapse Check (runs after every new file is written)
 
 After writing any new file, the agent must ask itself:
@@ -367,10 +446,10 @@ The agent must not proceed until the human responds.
 
 | Situation | Correct action |
 |---|---|
-| `user_validator.py` (12 lines) only ever called from `user_registration.py` | Collapse into `user_registration.py` |
-| `query_builder.py` (40 lines) used only by `report_generator.py` | Collapse into `report_generator.py` |
-| `email_formatter.py` called by 3 different modules | Keep separate — it has independent callers |
-| `csv_parser.py` (180 lines) and `csv_validator.py` (160 lines) both on the import graph of 4 modules | Keep separate — both are substantial and independently useful |
+| A small validation helper (12 lines) only ever called from one registration function | Collapse into the caller |
+| A small query-building helper used only by one report-generating function | Collapse into the caller |
+| A formatting helper called by three different unrelated modules | Keep separate — it has independent callers |
+| Two substantial files, both on the import graph of several other modules | Keep separate — both are substantial and independently useful |
 
 ---
 
@@ -424,6 +503,7 @@ These are not style preferences. These are safety violations. The agent must nev
 | Runtime `os.environ` mutation | `os.environ["PYTHONPATH"] = "..."` | Leaks state between processes, non-thread-safe | `python-dotenv`, config objects, or explicit value passing |
 | Silent error swallowing with wrong fallback | `try: x = fetch(); except: x = guess()` | Masks the real bug and produces wrong data silently | Log the error, re-raise, or return an explicit error sentinel |
 | Decorative Unicode in code or comments | Emojis, em dashes, Unicode arrows, box-drawing borders in source code | Adds noise, breaks grep/searchability, unprofessional | Plain ASCII. Use `[x]` for checkmarks, `->` for arrows, `--` for dashes |
+| Unjustified magic value | An inline number, regex, or format assumption with no traceable source (see Magic Value Gate) | Works on imagined examples, breaks on real data, invisible as a decision | Derive from requirement/existing code/real data, name it, comment its source, or ask |
 
 **The hack-alert phrase:** When the agent encounters a situation that tempts one of these patterns, it must write:
 
@@ -466,7 +546,7 @@ Just as the Complexity Ladder controls abstraction, the Convention Ladder contro
 
 ### Reuse-Over-Rewrite Rule
 
-Before creating any new function, class, or model, the agent must first ask: *"Can I reuse an existing artifact for this purpose?"*
+Before creating any new function, class, model, constant, or threshold, the agent must first ask: *"Can I reuse an existing artifact for this purpose?"*
 
 Only if the answer is NO — with a documented reason — may the agent create something new.
 
@@ -474,6 +554,7 @@ Only if the answer is NO — with a documented reason — may the agent create s
 - The existing function has a different contract (different return type, different side effects)
 - The existing class serves a fundamentally different responsibility
 - The existing model has a different schema that cannot be extended or composed
+- The existing constant or threshold governs a different scenario and reusing it would silently conflate two unrelated decisions
 
 **Invalid reasons (the agent must NOT use these):**
 - "I didn't see it" → Discovery was incomplete; go back and search again
@@ -481,6 +562,7 @@ Only if the answer is NO — with a documented reason — may the agent create s
 - "I wanted to write it my way" → Follow existing conventions, not personal preference
 - "The existing one is too complex" → Simplify the existing one; don't create a shadow copy
 - "The shared/infrastructure layer doesn't do exactly what I need" → Extend that layer, or create it as its own module if it doesn't exist yet. Do not embed a private copy of a cross-cutting concern inside a domain or feature module
+- "I needed a number and picked one" → This is exactly what the Magic Value Gate exists to stop
 
 ---
 
@@ -684,7 +766,9 @@ a) DOMAIN SCAN
     - Existing classes/models: [list with file:line, or 'none found']
     - Existing configs/settings: [list with file:line, or 'none found']
     - Existing Pydantic models / TypedDicts: [list or 'none found']
-    - Existing base classes / ABCs / interfaces: [list or 'none found']"
+    - Existing base classes / ABCs / interfaces: [list or 'none found']
+    - Existing constants, thresholds, limits, or patterns relevant to this feature:
+      [list with file:line, or 'none found']"
 
 b) CONVENTION DETECTION
    "I observed the following project conventions:
@@ -708,7 +792,7 @@ d) DEPENDENCY & CONTRACT CHECK
     (Or: 'No existing artifacts are relevant to this feature.')"
 ```
 
-**If the agent finds an existing function, class, or model that could serve the same purpose**, it must propose reuse and wait for confirmation before creating anything new. See the Reuse-Over-Rewrite Rule in Part 2.
+**If the agent finds an existing function, class, model, constant, or threshold that could serve the same purpose**, it must propose reuse and wait for confirmation before creating anything new. See the Reuse-Over-Rewrite Rule in Part 2.
 
 ---
 
@@ -748,6 +832,7 @@ It exits as [output type/shape].
 - What this approach does (2 sentences, plain English)
 - Why this approach over the obvious alternative (1 sentence)
 - What could break (1 sentence — edge cases this approach assumes away or doesn't handle)
+- Any magic values this approach depends on (size limits, patterns, thresholds) and where each one comes from
 
 4. TODO LIST (edge cases acknowledged but NOT handled)
 
@@ -760,12 +845,13 @@ It exits as [output type/shape].
 - "Merge function B into function A — they're the same responsibility."
 - "Drop the class — this can be a single function."
 - "Rename `parse_row` to `parse_csv_row` — be explicit about what it parses."
+- "That threshold/limit is wrong — here's the real value."
 - "Accept the skeleton. Now implement only the happy path for [function_name]."
 - "Accept the skeleton. Implement everything."
 
 **The agent must NOT write a single body until the human says "implement."** If the human says "implement only the happy path," the agent implements the core logic with no error handling, no edge cases, no validation beyond what's necessary to make the function work for valid input. Everything else becomes a TODO.
 
-**Why this matters:** The skeleton phase makes architectural decisions visible and reversible. The human can reshape the design at the cheapest possible moment — before any implementation exists. It also enforces the "Explain Then Implement" principle: the agent cannot write code it cannot first explain in plain English.
+**Why this matters:** The skeleton phase makes architectural decisions visible and reversible. The human can reshape the design at the cheapest possible moment — before any implementation exists. It also enforces the "Explain Then Implement" principle: the agent cannot write code it cannot first explain in plain English — including the values that code depends on.
 
 ---
 
@@ -783,7 +869,8 @@ The input is [X]. The output is [Y]. Is that correct?"
 "The data flowing through this will look like:
 Input: [example or schema]
 Output: [example or schema]
-Does that match your expectation?"
+Does that match your expectation? Are there any size limits, formats, or
+boundary conditions I should know about instead of guessing?"
 → Wait for confirmation before continuing.
 
 3. SIMPLICITY CHOICE
@@ -812,6 +899,19 @@ Do you want the abstraction or the flat version?"
 
 **If the user doesn't clearly understand the trade-off, explain it first. Do not proceed to implementation until the user makes an explicit choice.**
 
+### Before Introducing Any Magic Value
+
+Before writing a size limit, regex, threshold, timeout, or format assumption that isn't already justified by the requirement or the codebase (see the Magic Value Gate in Part 2):
+
+```
+"I need a value for [what it controls].
+I don't have this from the requirement, existing code, or real example data.
+Proposed guess: [value], because [reasoning].
+Alternative: leave it unbounded / flagged with a TODO until real data tells us the right value.
+Which do you want?"
+```
+
+
 ### After Completing Each Unit
 
 After every function or class implementation:
@@ -820,6 +920,7 @@ After every function or class implementation:
 "I've implemented [function_name].
 What it does: [one sentence]
 Key decision I made: [most important choice, e.g. "I return None instead of raising an exception because..."]
+Magic values used and their source: [e.g. "MAX_RETRY_COUNT = 3, from the stated requirement"]
 TODOs deferred: [list any TODOs added]
 
 Before I continue: can you read the function and tell me in your own words what it does?
@@ -848,6 +949,7 @@ unless you tell me otherwise. Confirm?"
 - Deferred as TODOs: [list of edge cases deferred]
 - Works for: [what real data it handles]
 - Does NOT handle: [what it explicitly doesn't handle yet]
+- Magic values introduced: [list each one and its justification]
 
 Ready to start [next feature]? Or do you want to review anything first?"
 ```
@@ -858,7 +960,11 @@ Before any non-trivial implementation, the agent must ask:
 
 > "Is there a simpler version of this that handles what you need today, even if it won't handle everything later?"
 
-This single question, asked consistently, prevents more over-engineering than all other rules combined.
+This single question, asked consistently, prevents more over-engineering than all other rules combined. Its counterpart, just as important:
+
+> "Am I about to guess a number, pattern, or format instead of asking or deriving it from something real?"
+
+This second question, asked consistently, prevents more production breakage than all other rules combined.
 
 ---
 
@@ -897,6 +1003,9 @@ Every non-obvious algorithm must have a comment block:
 # LIMITATION: [What this doesn't handle — edge cases deferred]
 ```
 
+Any threshold, limit, or pattern the algorithm depends on must pass the Magic Value Gate before it appears in this block — "sufficient for expected data sizes" is only true if "expected data sizes" is a real, stated number, not an assumption.
+
+
 ### The Testing-First Algorithm Rule
 
 Before implementing any algorithm:
@@ -916,16 +1025,17 @@ At these specific points, the agent must STOP and WAIT for explicit human approv
 | About to create a new file | States single-concern declaration ("this file owns [X]"), confirms it passes the no-conjunction/no-exclusion test, runs the business-vs-technical test, shows how it fits the existing package axis | Approve the declaration or redesign the package structure |
 | About to create a second file for a feature already served by one file | Runs the collapse check: "Would a developer need both files open simultaneously? Can I instead add [N] lines to [existing_file.py]?" | Approve the split or collapse into existing file |
 | A module is about to own a cross-cutting concern (logging, tracing, config, auth, caching, persistence, serialization, resilience) | Names the concern, states it is cross-cutting, identifies which layer should own it, proposes routing there | Confirm the owning layer, or justify why this module must own it |
+| About to write a size limit, regex, truncation, threshold, or format assumption not already justified | Runs the Magic Value Gate: names what the value controls, checks requirement/existing code/real data, proposes a guess or a deferral | Approve the value, correct it, or defer with a TODO |
 | About to create a class | Explains what the class represents, its responsibility, its methods, and the flat alternative | Approve or ask for flat alternative |
 | About to add an external dependency | Names the library, explains why, names the alternative | Approve or ask agent to avoid it |
 | Function body exceeds 15 lines | Shows the body, asks if it should be split | Split or accept |
 | Two functions have similar logic (possible DRY candidate) | Shows both, proposes shared abstraction OR explains why duplication is acceptable | Decide whether to abstract |
-| Completing a feature and about to start the next | Summary of what was built and deferred | Confirm or review first |
+| Completing a feature and about to start the next | Summary of what was built and deferred, including magic values introduced | Confirm or review first |
 | About to use a banned pattern | Writes "HACK ALERT: [pattern] because [reason]. Proper way: [alternative]." | Approve alternative or request different approach |
 | Found existing code that overlaps with planned feature | Shows existing function/class and explains why it can or cannot be reused | Confirm reuse or justify why new is needed |
 | Project conventions are unclear or conflicting | Lists conflicting patterns found, asks for clarification | Declare which convention to follow |
 | A config, model, or contract is missing that the feature needs | Says what's needed and where it would go | Decide whether to add it now or hardcode with a TODO |
-| Skeleton produced and ready for human review | Outputs full skeleton (signatures, data flow, explain approach, TODO list) | Merge, split, drop, rename signatures; then say "implement" or "implement only happy path" |
+| Skeleton produced and ready for human review | Outputs full skeleton (signatures, data flow, explain approach, magic values and their sources, TODO list) | Merge, split, drop, rename signatures, correct values; then say "implement" or "implement only happy path" |
 | Feature implementation complete | Produces "minimal version" with every non-essential abstraction, helper, and class stripped out | Compare the two versions. The gap is the complexity tax. Keep what you want from the original. |
 
 **The review gate phrase:**
@@ -941,22 +1051,25 @@ After every feature implementation, the human should run this ritual. It is the 
 
 **The human says:**
 
-> "Now remove every abstraction, class, and helper function that is not strictly necessary for the current test case to pass. Show me the minimal version."
+> "Now remove every abstraction, class, and helper function that is not strictly necessary for the current test case to pass. Show me the minimal version. Also list every magic value in the code and where it came from."
 
 **The agent must produce:**
 
 1. The **original version** (what was built)
 2. The **minimal version** (everything non-essential stripped out — flat functions only, no classes that could be a function, no helpers that inline to under 20 lines, no models that could be a plain dict)
 3. A **diff summary** listing what was removed and why it was unnecessary for this specific test case
+4. A **magic value inventory** — every literal, pattern, or threshold in the code, and whether it came from the requirement, existing code, real data, or an approved guess
 
-**The human then compares the two.** The gap between them is the **complexity tax** — the abstractions, patterns, and indirections the agent added beyond what was strictly required. The human decides what to keep:
+**The human then compares the two.** The gap between them is the **complexity tax** — the abstractions, patterns, and indirections the agent added beyond what was strictly required. The magic value inventory is the **assumption tax** — the guesses baked into the code that the human never explicitly approved. The human decides what to keep:
 
 - "Keep the class — I can see it'll matter for the next feature."
 - "Keep the Pydantic model — the type safety is worth the cost."
 - "Drop everything else. The minimal version is what we ship."
 - "Drop the helper function but keep the error handling."
+- "That threshold is wrong — here's the real number."
+- "That regex is too narrow — here's an example it would incorrectly reject."
 
-**This ritual must be run at least once per feature.** The first time reveals how much complexity the agent defaults to. Over time, it trains the agent to default to simpler solutions, because it learns that stripped-down code is what survives review.
+**This ritual must be run at least once per feature.** The first time reveals how much complexity — and how many unexamined guesses — the agent defaults to. Over time, it trains the agent to default to simpler solutions and justified values, because it learns that stripped-down, well-sourced code is what survives review.
 
 ---
 
@@ -984,6 +1097,25 @@ Each new class, Pydantic model, private helper (beyond 2), layer of indirection,
 or new file costs 1 point. If you would exceed 3 points, stop and write:
 "BUDGET EXCEEDED: This would cost [N] points. Simplify to [strategy], or approve higher cost?"
 Budget resets with each new user request.
+
+======= MAGIC VALUE RULES =======
+
+Never invent a size limit, truncation point, regular expression, confidence or
+similarity threshold, retry/timeout count, or format assumption on your own judgment.
+Before writing any such value, check in this order:
+1. Is it stated in the requirement? Use it, cite it.
+2. Does an existing constant, config, or schema already define it? Reuse it.
+3. Can it be derived from real example data the human provided? Derive it, explain how.
+4. None of the above? STOP and write:
+"MAGIC VALUE GATE: I need a value for [what it controls]. I don't have this from
+the requirement, existing code, or example data. Proposed: [value], clearly labeled
+as a guess. Alternative: leave unbounded/unvalidated with a TODO until real data
+is available. Which do you want?"
+
+Every value that survives this gate must become a named constant with a one-line
+comment stating its source (requirement / existing code / real data / approved guess).
+Never leave a bare literal, pattern, or threshold unexplained in the code.
+This applies regardless of function size — a one-line function can still fail this gate.
 
 ======= COLLAPSE CHECK =======
 
@@ -1082,7 +1214,8 @@ After context discovery, do NOT jump to implementation. Output a SKELETON first:
 1. Signatures only (no bodies — use pass or ...)
 2. Data flow in 3 sentences: input -> transformations -> output
 3. For non-trivial logic: plain-English explanation (2 sentences),
-   why this over the alternative (1 sentence), what could break (1 sentence)
+   why this over the alternative (1 sentence), what could break (1 sentence),
+   and any magic values this depends on plus their source
 4. TODO list of edge cases acknowledged but NOT handled
 
 WAIT for human to say "implement" or "implement only happy path for X."
@@ -1099,15 +1232,20 @@ BEFORE any new abstraction (class, base class, model, pattern), you MUST ask:
 "I'm about to create [Name]. Reason: [why now]. Alternative: [flat version with limitation]. Which?"
 Do not create the abstraction until confirmed.
 
+BEFORE any unjustified magic value (limit, regex, threshold, format assumption), you MUST ask
+per the Magic Value Rules above. Do not write the literal until confirmed or explicitly deferred.
+
 AFTER each function, you MUST say:
 "Built: [function_name] — [one sentence what it does].
 Decision made: [most important choice].
+Magic values used and their source: [list, or 'none'].
 TODOs deferred: [list].
 Please read it and tell me if anything is unclear before I continue."
 
 BEFORE moving to the next feature, you MUST say:
 "Feature complete. Built: [list]. Deferred: [list]. Handles: [scope].
-Does NOT handle: [explicit non-scope]. Ready for next feature?"
+Does NOT handle: [explicit non-scope]. Magic values introduced: [list].
+Ready for next feature?"
 
 ======= EDGE CASES =======
 
@@ -1122,14 +1260,16 @@ Write a TODO comment in this exact format:
 Start with the simplest correct algorithm (Level 1: brute force / direct).
 Do not optimize unless slowness is measured, not assumed.
 Every non-obvious algorithm needs a comment: WHAT, WHY THIS APPROACH, COMPLEXITY, LIMITATION.
+Any threshold or limit named in that comment must have passed the Magic Value Gate first.
+
 
 ======= REVIEW GATES =======
 
 Stop and write "REVIEW GATE: [decision needed]. I will not continue until confirmed."
 Trigger this before: creating a new file, creating a class, creating a second file for a
-feature already served by one file (run collapse check first), adding a new external
-dependency, when a function exceeds 15 lines, when you notice duplicated logic,
-before starting any new feature.
+feature already served by one file (run collapse check first), writing an unjustified
+magic value (run the Magic Value Gate), adding a new external dependency, when a function
+exceeds 15 lines, when you notice duplicated logic, before starting any new feature.
 
 ======= STRIP-IT-DOWN RULES =======
 
@@ -1140,8 +1280,14 @@ When the human says "strip it down," produce the MINIMAL version:
 - Remove every layer of indirection (wrappers, adapters, delegates)
 - Remove error handling beyond what the happy path needs
 
-Show: (1) original, (2) minimal version, (3) diff of what was removed and why.
-The gap between them is the complexity tax. The human decides what to keep.
+Also produce a MAGIC VALUE INVENTORY: every literal, pattern, or threshold in the
+code, and whether it came from the requirement, existing code, real data, or an
+approved guess.
+
+Show: (1) original, (2) minimal version, (3) diff of what was removed and why,
+(4) the magic value inventory.
+The gap between original and minimal is the complexity tax.
+The magic value inventory is the assumption tax. The human decides what to keep.
 
 ======= LEGITIMACY RULES =======
 
@@ -1157,6 +1303,8 @@ Never produce any of these patterns. They are safety violations, not style issue
 - Mutating os.environ at runtime — use config objects or explicit value passing
 - Silent error swallowing: catching Exception and returning a guess value
 - Decorative Unicode in code or comments — plain ASCII only
+- An unjustified magic value: any literal, regex, or threshold with no traceable
+  source in the requirement, existing code, or real data
 
 If you encounter a situation where one of these seems necessary, STOP.
 Write: "HACK ALERT: I'm tempted to use [pattern] because [reason].
@@ -1166,16 +1314,18 @@ The proper way to solve this is [alternative]. Should I proceed with [alternativ
 
 Before writing any code, you MUST:
 1. Search the codebase for existing functions, classes, models, Pydantic models,
-   TypedDicts, configs, and base classes related to the feature domain. Report what you found.
+   TypedDicts, configs, base classes, constants, and thresholds related to the
+   feature domain. Report what you found.
 2. Identify the project's conventions (naming, imports, quote style, error handling,
    type annotations, testing). Follow them. Do not impose your own.
-3. Verify your proposed function/class name does not duplicate existing functionality.
+3.Verify your proposed function/class/constant does not duplicate existing functionality.
    If something similar exists, reuse it — do not create a shadow copy.
 4. Check for existing contracts (Pydantic models, ABCs, interfaces) that your code
    must implement or respect. Reuse them. Do not redefine them.
 
-Rule: Reuse before you rewrite. If an existing function does what you need,
-use it. Do not create a duplicate just because it's in a different file.
+Rule: Reuse before you rewrite. If an existing function, constant, or threshold does
+what you need, use it. Do not create a duplicate just because it's in a different file,
+and do not invent a new number when one already governs this scenario.
 
 ======= FEATURE ISOLATION =======
 
@@ -1193,20 +1343,23 @@ are independently working.
 1. Write the function signature yourself
 2. State the feature in one sentence: "[input] → [processing] → [output]"
 3. State what "done" looks like: "Works when [specific real input] returns [specific output]"
+4. If you already know a real limit, format, or threshold that matters, say so up front — don't make the agent guess it
 
 **Before every implementation (agent's job):**
-0. Context discovery — search existing code, detect conventions, check for duplicates
-1. Skeleton first — output signatures only (no bodies), data flow, explanation, TODOs. WAIT for "implement."
+0. Context discovery — search existing code, detect conventions, check for duplicates and existing constants/thresholds
+1. Skeleton first — output signatures only (no bodies), data flow, explanation, magic values and their sources, TODOs. WAIT for "implement."
 2. Scope check — confirm the understanding
 3. Simplicity choice — offer simple vs. complete, default to simple
-4. Data shape — show what goes in and out
+4. Data shape — show what goes in and out, including size/format boundaries
 5. Complexity budget — count points before writing; stop and ask if budget would exceed 3
+6. Magic value gate — for every limit, pattern, or threshold, trace it to the requirement, existing code, or real data, or stop and ask
 
 **After every function (agent's job):**
 1. One-sentence summary of what was built
 2. Most important decision made
-3. TODOs added
-4. Request for human review before continuing
+3. Magic values used and their source
+4. TODOs added
+5. Request for human review before continuing
 
 **Red flags to stop immediately:**
 - A new file was created without a single-concern declaration — no stated ownership, or ownership described by "and", by a vague word like "management/handling/misc", or by exclusion ("everything that isn't X")
@@ -1214,6 +1367,8 @@ are independently working.
 - A file serving the same business concern as an existing file was created without justification
 - Sibling files in a package follow different organizing axes — some by entity, some by stage, some by exclusion — meaning the package has no consistent principle
 - A domain or feature module owns the machinery of a cross-cutting concern (logging, tracing, config, auth, caching, persistence) instead of using a dedicated layer
+- A bare number, regex, or format assumption appears in the code with no comment tracing it to a requirement, existing constant, or real data
+- A truncation, split, or index-into-parsed-data operation appears without a stated decision about what happens to the discarded or assumed part
 - Agent skipped the skeleton phase — jumped straight to full implementation without signatures-only review
 - Agent exceeded complexity budget without asking (3+ classes/models/helpers/layers in one request)
 - A local variable uses an abbreviation — `cfg`, `res`, `tmp`, `mgr`, `svc`, `val`, or any other shorthand. Full words only, always
@@ -1224,7 +1379,7 @@ are independently working.
 - Agent used a banned pattern (sys.path hack, eval, bare except, mutable default arg, decorative Unicode, etc.)
 - Agent created a function/class that duplicates existing code without justification
 - Agent created a class you didn't ask for — if you didn't request it by name, it must ask before creating it
-- Agent ignored existing Pydantic models, configs, or contracts and created parallel ones
+- Agent ignored existing Pydantic models, configs, constants, or contracts and created parallel ones
 - A function has more than 3 levels of nesting
 - You can't explain what a function does after reading it
 - A new external library appeared without explanation
@@ -1233,18 +1388,20 @@ are independently working.
 - You feel like you need to re-read the code to understand what you just asked for
 
 **The strip-it-down ritual (run after every feature):**
-> "Now remove every abstraction, class, and helper function that is not strictly necessary for the current test case to pass. Show me the minimal version."
+> "Now remove every abstraction, class, and helper function that is not strictly necessary for the current test case to pass. Show me the minimal version. Also list every magic value in the code and where it came from."
 
-The gap between the original and the minimal version is the complexity tax. Decide what to keep.
+The gap between the original and the minimal version is the complexity tax. The magic value inventory is the assumption tax. Decide what to keep and what to correct.
 
-**The one question that prevents most over-engineering:**
+**The two questions that prevent most production failures:**
 > "Is there a simpler version that handles what I need today?"
+> "Am I about to guess a number, pattern, or format instead of asking or deriving it from something real?"
 
 ---
 
 *You are the architect. The agent is the implementer.
 Architects make decisions. Implementers write code from decided decisions.
-Every principle in this document enforces that boundary.*
+Every principle in this document enforces that boundary — including the boundary
+between a decision that was made and a guess that was never noticed.*
 
 ---
 
@@ -1261,6 +1418,7 @@ Before implementing:
 - If multiple interpretations exist, present them — don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
+- If a value, limit, or pattern isn't given anywhere, don't invent one silently — name it as unknown and ask.
 
 ### 8.2 Simplicity First
 
@@ -1271,8 +1429,10 @@ Minimum code that solves the problem. Nothing speculative.
 - No "flexibility" or "configurability" that wasn't requested.
 - No error handling for impossible scenarios.
 - If you write 200 lines and it could be 50, rewrite it.
+- No numeric or pattern-based assumptions that weren't requested, reused, or derived from real data.
 
 Ask yourself: *"Would a senior engineer say this is overcomplicated?"* If yes, simplify.
+Ask yourself: *"Would a senior engineer ask 'where did this number come from?' and get a real answer?"* If not, fix it before moving on.
 
 ### 8.3 Surgical Changes Only
 
@@ -1283,6 +1443,7 @@ When editing existing code:
 - Don't refactor things that aren't broken.
 - Match existing style, even if you'd do it differently.
 - If you notice unrelated dead code, mention it — don't delete it.
+- If you notice an existing unjustified magic value nearby, mention it — don't silently "fix" it as part of an unrelated change.
 
 When your changes create orphans:
 - Remove imports/variables/functions that YOUR changes made unused.
@@ -1309,4 +1470,4 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let the agent loop independently until verified.
 Weak criteria ("make it work") require constant clarification.
 
-**These guidelines are working if:** fewer unnecessary changes appear in diffs, fewer rewrites happen due to overcomplication, and clarifying questions come *before* implementation rather than *after* mistakes.
+**These guidelines are working if:** fewer unnecessary changes appear in diffs, fewer rewrites happen due to overcomplication, fewer unexplained numbers or patterns show up in review, and clarifying questions come *before* implementation rather than *after* mistakes.
